@@ -176,6 +176,8 @@ Code  Seq#    Include File                                             Comments
 'P'   60-6F  sound/sscape_ioctl.h                                      conflict!
 'P'   00-0F  drivers/usb/class/usblp.c                                 conflict!
 'P'   01-09  drivers/misc/pci_endpoint_test.c                          conflict!
+'N'   80-8F  uapi/linux/ntsync.h                                     NT synchronization primitives
+                                                                     <mailto:wine-devel@winehq.org>
 'Q'   all    linux/soundcard.h
 'R'   00-1F  linux/random.h                                            conflict!
 'R'   01     linux/rfkill.h                                            conflict!
