@@ -5,7 +5,6 @@
  * Copyright (C) 2009/2010 Stefani Seibold <stefani@seibold.net>
  */
 
-#ifndef __GENKSYMS__
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/kfifo.h>
@@ -13,15 +12,6 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#else
-#include <linux/kernel.h>
-#include <linux/export.h>
-#include <linux/slab.h>
-#include <linux/err.h>
-#include <linux/log2.h>
-#include <linux/uaccess.h>
-#include <linux/kfifo.h>
-#endif
 
 /*
  * internal helper to calculate the unused elements in a fifo
