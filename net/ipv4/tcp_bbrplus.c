@@ -80,12 +80,12 @@ struct bbr {
 #define CYCLE_LEN	8
 
 static const int bbr_bw_rtts		= CYCLE_LEN + 2;
-static const u32 bbr_min_rtt_win_sec	= 10;
-static const u32 bbr_probe_rtt_mode_ms	= 200;
+static const u32 bbr_min_rtt_win_sec      = 6;
+static const u32 bbr_probe_rtt_mode_ms    = 80;
 static const int bbr_min_tso_rate	= 1200000;
 static const int bbr_high_gain		= BBR_UNIT * 2885 / 1000 + 1;
 static const int bbr_drain_gain		= BBR_UNIT * 1000 / 2885;
-static const int bbr_cwnd_gain		= BBR_UNIT * 2;
+static const int bbr_cwnd_gain		= BBR_UNIT * 9 / 4;
 
 enum bbr_pacing_gain_phase {
 	BBR_BW_PROBE_UP     = 0,
@@ -94,25 +94,25 @@ enum bbr_pacing_gain_phase {
 };
 
 static const int bbr_pacing_gain[] = {
-	BBR_UNIT * 5 / 4,
-	BBR_UNIT * 3 / 4,
+	BBR_UNIT * 11 / 8,
+    BBR_UNIT * 17 / 20,
 	BBR_UNIT, BBR_UNIT, BBR_UNIT,
 	BBR_UNIT, BBR_UNIT, BBR_UNIT
 };
 
 static const u32 bbr_cycle_rand		= 7;
 static const u32 bbr_cwnd_min_target	= 4;
-static const u32 bbr_full_bw_thresh	= BBR_UNIT * 5 / 4;
-static const u32 bbr_full_bw_cnt	= 3;
+static const u32 bbr_full_bw_thresh	= BBR_UNIT * 23 / 20;
+static const u32 bbr_full_bw_cnt	= 2;
 static const u32 bbr_lt_intvl_min_rtts	= 4;
 static const u32 bbr_lt_loss_thresh	= 50;
 static const u32 bbr_lt_bw_ratio	= BBR_UNIT / 8;
 static const u32 bbr_lt_bw_diff		= 4000 / 8;
 static const u32 bbr_lt_bw_max_rtts	= 48;
 static const int bbr_extra_acked_gain	= BBR_UNIT;
-static const u32 bbr_extra_acked_win_rtts = 10;
+static const u32 bbr_extra_acked_win_rtts = 12;
 static const u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
-static const u32 bbr_extra_acked_max_us	= 100 * 1000;
+static const u32 bbr_extra_acked_max_us	= 160 * 1000;
 static const bool bbr_drain_to_target	= true;
 
 static bool bbrplus_snd_wnd_test(const struct tcp_sock *tp,
@@ -795,7 +795,7 @@ static void bbr_init(struct sock *sk)
 
 static u32 bbr_sndbuf_expand(struct sock *sk)
 {
-	return 3;
+	return 4;
 }
 
 static u32 bbr_undo_cwnd(struct sock *sk)
