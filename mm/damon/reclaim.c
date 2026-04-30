@@ -27,7 +27,7 @@
  * condition.  Refer to below descriptions for the watermarks parameter for
  * this.
  */
-static bool enabled __read_mostly;
+static bool enabled __read_mostly = true;
 
 /*
  * Time threshold for cold memory regions identification in microseconds.
@@ -103,7 +103,7 @@ module_param(wmarks_high, ulong, 0600);
  * the low watermark, DAMON_RECLAIM becomes active, so starts the monitoring
  * and the reclaiming.  400 (40%) by default.
  */
-static unsigned long wmarks_mid __read_mostly = 400;
+static unsigned long wmarks_mid __read_mostly = 350;
 module_param(wmarks_mid, ulong, 0600);
 
 /*
