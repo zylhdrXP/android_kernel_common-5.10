@@ -2,9 +2,8 @@
 /*
  * TCP BBRplus Congestion Control
  *
- * BBRplus is an enhanced version of Google's BBR (Bottleneck Bandwidth
- * and RTT) congestion control algorithm. It improves upon vanilla BBR
- * with more aggressive bandwidth probing and better RTT estimation.
+ * Enhanced BBR with drain-to-target cycling, tuned for low-latency gaming
+ * and sustained throughput on mobile (4G/5G/Wi-Fi).
  *
  * Originally introduced by:
  *   - dog250 <yyforkitty@gmail.com>
@@ -13,7 +12,7 @@
  * Upstream 5.10 port:
  *   - UJX6N <https://github.com/UJX6N/bbrplus-5.10>
  *
- * GKI 5.10 compatibility fixes (struct size, KMI, ops interface):
+ * GKI 5.10 compatibility + tuning:
  *   - Steambot12 <wilfridus.it@gmail.com>
  */
 #include <linux/module.h>
@@ -80,12 +79,12 @@ struct bbr {
 #define CYCLE_LEN	8
 
 static const int bbr_bw_rtts		= CYCLE_LEN + 2;
-static const u32 bbr_min_rtt_win_sec      = 6;
-static const u32 bbr_probe_rtt_mode_ms    = 80;
+static const u32 bbr_min_rtt_win_sec	= 5;
+static const u32 bbr_probe_rtt_mode_ms	= 50;
 static const int bbr_min_tso_rate	= 1200000;
 static const int bbr_high_gain		= BBR_UNIT * 2885 / 1000 + 1;
 static const int bbr_drain_gain		= BBR_UNIT * 1000 / 2885;
-static const int bbr_cwnd_gain		= BBR_UNIT * 9 / 4;
+static const int bbr_cwnd_gain		= BBR_UNIT * 2;
 
 enum bbr_pacing_gain_phase {
 	BBR_BW_PROBE_UP     = 0,
@@ -94,26 +93,25 @@ enum bbr_pacing_gain_phase {
 };
 
 static const int bbr_pacing_gain[] = {
-	BBR_UNIT * 11 / 8,
-    BBR_UNIT * 17 / 20,
-	BBR_UNIT, BBR_UNIT, BBR_UNIT,
-	BBR_UNIT, BBR_UNIT, BBR_UNIT
+	BBR_UNIT * 5 / 4,
+	BBR_UNIT * 3 / 4,
+	BBR_UNIT,
 };
 
 static const u32 bbr_cycle_rand		= 7;
 static const u32 bbr_cwnd_min_target	= 4;
-static const u32 bbr_full_bw_thresh	= BBR_UNIT * 23 / 20;
-static const u32 bbr_full_bw_cnt	= 2;
+static const u32 bbr_full_bw_thresh	= BBR_UNIT * 5 / 4;
+static const u32 bbr_full_bw_cnt	= 3;
 static const u32 bbr_lt_intvl_min_rtts	= 4;
 static const u32 bbr_lt_loss_thresh	= 50;
 static const u32 bbr_lt_bw_ratio	= BBR_UNIT / 8;
 static const u32 bbr_lt_bw_diff		= 4000 / 8;
-static const u32 bbr_lt_bw_max_rtts	= 48;
+static const u32 bbr_lt_bw_max_rtts	= 64;
 static const int bbr_extra_acked_gain	= BBR_UNIT;
-static const u32 bbr_extra_acked_win_rtts = 12;
+static const u32 bbr_extra_acked_win_rtts = 10;
 static const u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
-static const u32 bbr_extra_acked_max_us	= 160 * 1000;
-static const bool bbr_drain_to_target	= true;
+static const u32 bbr_extra_acked_max_us	= 100 * 1000;
+static const int bbr_probe_rtt_cwnd_gain = BBR_UNIT * 1 / 2;
 
 static bool bbrplus_snd_wnd_test(const struct tcp_sock *tp,
 				  const struct sk_buff *skb,
@@ -142,8 +140,8 @@ static void bbr_set_cycle_idx(struct sock *sk, int cycle_idx)
 			   BBR_UNIT : bbr_pacing_gain[bbr->cycle_idx];
 }
 
-u32 bbr_max_bw(const struct sock *sk);
-u32 bbr_inflight(struct sock *sk, u32 bw, int gain);
+static u32 bbr_max_bw(const struct sock *sk);
+static u32 bbr_inflight(struct sock *sk, u32 bw, int gain);
 
 static void bbr_drain_to_target_cycling(struct sock *sk,
 					const struct rate_sample *rs)
@@ -192,7 +190,7 @@ static u16 bbr_extra_acked(const struct sock *sk)
 	return max(bbr->extra_acked[0], bbr->extra_acked[1]);
 }
 
-u32 bbr_max_bw(const struct sock *sk)
+static u32 bbr_max_bw(const struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
@@ -265,7 +263,7 @@ static u32 bbr_tso_segs_goal(struct sock *sk)
 		      sk->sk_pacing_rate >> READ_ONCE(sk->sk_pacing_shift),
 		      sk->sk_gso_max_size - 1 - MAX_TCP_HEADER);
 	segs = max_t(u32, bytes / tp->mss_cache, min_segs);
-	return min_t(u32, segs & 0xFF, 0x7FU);
+	return min_t(u32, segs, 0x7FU);
 }
 
 static u32 bbr_min_tso_segs(struct sock *sk)
@@ -312,18 +310,18 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
 	return bdp;
 }
 
-static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd, int gain)
+static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
 {
 	cwnd += 3 * bbr_tso_segs_goal(sk);
 	return cwnd;
 }
 
-u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
+static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
 {
 	u32 inflight;
 
 	inflight = bbr_bdp(sk, bw, gain);
-	inflight = bbr_quantization_budget(sk, inflight, gain);
+	inflight = bbr_quantization_budget(sk, inflight);
 	return inflight;
 }
 
@@ -377,6 +375,18 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	return false;
 }
 
+static u32 bbr_probe_rtt_cwnd(struct sock *sk)
+{
+	u32 cwnd;
+
+	if (bbr_probe_rtt_cwnd_gain == 0)
+		return bbr_cwnd_min_target;
+
+	cwnd = bbr_bdp(sk, bbr_bw(sk), bbr_probe_rtt_cwnd_gain);
+	cwnd = bbr_quantization_budget(sk, cwnd);
+	return max(cwnd, bbr_cwnd_min_target);
+}
+
 static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 			 u32 acked, u32 bw, int gain)
 {
@@ -392,7 +402,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 
 	target_cwnd = bbr_bdp(sk, bw, gain);
 	target_cwnd += bbr_ack_aggregation_cwnd(sk);
-	target_cwnd = bbr_quantization_budget(sk, target_cwnd, gain);
+	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
 
 	if (bbr_full_bw_reached(sk))
 		cwnd = min(cwnd + acked, target_cwnd);
@@ -403,43 +413,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 done:
 	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
 	if (bbr->mode == BBR_PROBE_RTT)
-		tp->snd_cwnd = min(tp->snd_cwnd, bbr_cwnd_min_target);
-}
-
-static bool bbr_is_next_cycle_phase(struct sock *sk,
-				    const struct rate_sample *rs)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct bbr *bbr = inet_csk_ca(sk);
-	bool is_full_length =
-		tcp_stamp_us_delta(tp->delivered_mstamp, bbr->cycle_mstamp) >
-		bbr->min_rtt_us;
-	u32 inflight, bw;
-
-	if (bbr->pacing_gain == BBR_UNIT)
-		return is_full_length;
-
-	inflight = rs->prior_in_flight;
-	bw = bbr_max_bw(sk);
-
-	if (bbr->pacing_gain > BBR_UNIT)
-		return is_full_length &&
-			(rs->losses ||
-			 inflight >= bbr_inflight(sk, bw, bbr->pacing_gain));
-
-	return is_full_length ||
-		inflight <= bbr_inflight(sk, bw, BBR_UNIT);
-}
-
-static void bbr_advance_cycle_phase(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct bbr *bbr = inet_csk_ca(sk);
-
-	bbr->cycle_idx = (bbr->cycle_idx + 1) & (CYCLE_LEN - 1);
-	bbr->cycle_mstamp = tp->delivered_mstamp;
-	bbr->pacing_gain = bbr->lt_use_bw ?
-			   BBR_UNIT : bbr_pacing_gain[bbr->cycle_idx];
+		tp->snd_cwnd = min(tp->snd_cwnd, bbr_probe_rtt_cwnd(sk));
 }
 
 static void bbr_update_cycle_phase(struct sock *sk,
@@ -447,12 +421,8 @@ static void bbr_update_cycle_phase(struct sock *sk,
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	if (bbr_drain_to_target) {
+	if (bbr->mode == BBR_PROBE_BW)
 		bbr_drain_to_target_cycling(sk, rs);
-		return;
-	}
-	if (bbr->mode == BBR_PROBE_BW && bbr_is_next_cycle_phase(sk, rs))
-		bbr_advance_cycle_phase(sk);
 }
 
 static void bbr_reset_startup_mode(struct sock *sk)
@@ -469,10 +439,10 @@ static void bbr_reset_probe_bw_mode(struct sock *sk)
 	struct bbr *bbr = inet_csk_ca(sk);
 
 	bbr->mode = BBR_PROBE_BW;
-	bbr->pacing_gain = BBR_UNIT;
 	bbr->cwnd_gain = bbr_cwnd_gain;
-	bbr->cycle_idx = CYCLE_LEN - 1 - prandom_u32_max(bbr_cycle_rand);
-	bbr_advance_cycle_phase(sk);
+	bbr->cycle_len = CYCLE_LEN - prandom_u32_max(bbr_cycle_rand);
+	bbr->cycle_mstamp = tcp_sk(sk)->delivered_mstamp;
+	bbr_set_cycle_idx(sk, BBR_BW_PROBE_CRUISE);
 }
 
 static void bbr_reset_mode(struct sock *sk)
@@ -713,7 +683,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 		tp->app_limited =
 			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
 		if (!bbr->probe_rtt_done_stamp &&
-		    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+		    tcp_packets_in_flight(tp) <= bbr_probe_rtt_cwnd(sk)) {
 			bbr->probe_rtt_done_stamp = tcp_jiffies32 +
 				msecs_to_jiffies(bbr_probe_rtt_mode_ms);
 			bbr->probe_rtt_round_done = 0;
@@ -781,7 +751,7 @@ static void bbr_init(struct sock *sk)
 	bbr->full_bw_cnt = 0;
 	bbr->cycle_mstamp = 0;
 	bbr->cycle_idx = 0;
-	bbr->cycle_len = 0;
+	bbr->cycle_len = CYCLE_LEN;
 	bbr_reset_lt_bw_sampling(sk);
 	bbr_reset_startup_mode(sk);
 	bbr->ack_epoch_mstamp = tp->tcp_mstamp;
@@ -884,4 +854,4 @@ MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
 MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
 MODULE_AUTHOR("dog250 (BBRplus enhancements)");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_DESCRIPTION("TCP BBRplus - GKI2 5.10 compatible");
+MODULE_DESCRIPTION("TCP BBRplus — low-latency tuning, GKI 5.10");
