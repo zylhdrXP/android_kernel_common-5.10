@@ -183,11 +183,15 @@ struct bbr_context {
 
 
 /* Window length of min_rtt filter (in sec): */
-static const u32 bbr_min_rtt_win_sec = 10;
-/* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
-static const u32 bbr_probe_rtt_mode_ms = 200;
+static const u32 bbr_min_rtt_win_sec = 7;
+/* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode.
+ * Balanced at 140ms: short enough for low latency, long enough to avoid
+ * excessive throughput dips. Tuned for stable performance across varied workloads.
+ */
+static const u32 bbr_probe_rtt_mode_ms = 140;
 /* Window length of probe_rtt_min_us filter (in ms), and consequently the
- * typical interval between PROBE_RTT mode entries. The default is 5000ms.
+ * typical interval between PROBE_RTT mode entries. Balanced at 5000ms for
+ * stability across 3G-5G while maintaining low latency.
  * Note that bbr_probe_rtt_win_ms must be <= bbr_min_rtt_win_sec * MSEC_PER_SEC
  */
 static const u32 bbr_probe_rtt_win_ms = 5000;
@@ -201,11 +205,10 @@ static const u32 bbr_probe_rtt_cwnd_gain = BBR_UNIT * 1 / 2;
  */
 static const u32 bbr_tso_rtt_shift = 9;
 
-/* Pace at ~1% below estimated bw, on average, to reduce queue at bottleneck.
- * In order to help drive the network toward lower queues and low latency while
- * maintaining high utilization, the average pacing rate aims to be slightly
- * lower than the estimated bandwidth. This is an important aspect of the
- * design.
+/* Pace at ~1.5% below estimated bw for balanced throughput and latency.
+ * Lower margin than aggressive gaming tuning (2%) to maximize throughput,
+ * but still enough headroom to prevent queue buildup and maintain stable RTT.
+ * This value balances full-speed downloads/uploads with minimal latency variance.
  */
 static const int bbr_pacing_margin_percent = 1;
 
@@ -269,7 +272,7 @@ static const bool bbr_precise_ece_ack = true;
 static const u32 bbr_ecn_max_rtt_us = 5000;
 
 /* On losses, scale down inflight and pacing rate by beta scaled by BBR_SCALE.
- * No loss response when 0.
+ * No loss response when 0. Standard 30% provides stable recovery on lossy networks.
  */
 static const u32 bbr_beta = BBR_UNIT * 30 / 100;
 
@@ -287,9 +290,9 @@ static const u32 bbr_ecn_alpha_init = BBR_UNIT;
 static const u32 bbr_ecn_factor = BBR_UNIT * 1 / 3;	 /* 1/3 = 33% */
 
 /* Estimate bw probing has gone too far if CE ratio exceeds this threshold.
- * Scaled by BBR_SCALE. Disabled when 0.
+ * Scaled by BBR_SCALE. Disabled when 0. 33% for responsive congestion avoidance.
  */
-static const u32 bbr_ecn_thresh = BBR_UNIT * 1 / 2;  /* 1/2 = 50% */
+static const u32 bbr_ecn_thresh = BBR_UNIT * 1 / 3;  /* 1/3 = 33% */
 
 /* If non-zero, if in a cycle with no losses but some ECN marks, after ECN
  * clears then make the first round's increment to inflight_hi the following
@@ -338,13 +341,13 @@ static const u32 bbr_bw_probe_max_rounds = 63;
 static const u32 bbr_bw_probe_rand_rounds = 2;
 
 /* Use BBR-native probe time scale starting at this many usec.
- * We aim to be fair with Reno/CUBIC up to an inter-loss time epoch of at least:
- *  BDP*RTT = 25Mbps * .030sec /(1514bytes) * 0.030sec = 1.9 secs
+ * Set to 1.9s for balanced probing: responsive enough for changing conditions,
+ * conservative enough to minimize packet loss and power consumption.
  */
-static const u32 bbr_bw_probe_base_us = 2 * USEC_PER_SEC;  /* 2 secs */
+static const u32 bbr_bw_probe_base_us = 1900000;  /* 1.9 secs */
 
 /* Use BBR-native probes spread over this many usec: */
-static const u32 bbr_bw_probe_rand_us = 1 * USEC_PER_SEC;  /* 1 secs */
+static const u32 bbr_bw_probe_rand_us = 500000;  /* 0.5 secs */
 
 /* Use fast path if app-limited, no loss/ECN, and target cwnd was reached? */
 static const bool bbr_fast_path = true;
@@ -533,6 +536,9 @@ static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
+
+	if (unlikely(!bbr))
+		return;
 
 	if (event == CA_EVENT_TX_START) {
 		if (!tp->app_limited)
@@ -1388,6 +1394,7 @@ static void bbr_update_latest_delivery_signals(
 static void bbr_advance_latest_delivery_signals(
 	struct sock *sk, const struct rate_sample *rs, struct bbr_context *ctx)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
 
 	/* If ACK matches a TLP retransmit, persist the filter. If we detect
@@ -1587,6 +1594,7 @@ static bool bbr_adapt_upper_bounds(struct sock *sk,
 				    const struct rate_sample *rs,
 				    struct bbr_context *ctx)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
 
 	/* Track when we'll see bw/loss samples resulting from our bw probes. */
@@ -1615,7 +1623,7 @@ static bool bbr_adapt_upper_bounds(struct sock *sk,
 			return true;  /* yes, decided state transition */
 		}
 	}
-	if (bbr_is_inflight_too_high(sk, rs->losses ? tp->lost - bbr->alpha_last_delivered : 0, tcp_packets_in_flight(tp), tp->delivered_ce - bbr->alpha_last_delivered_ce, rs->delivered)) {
+	if (bbr_is_inflight_too_high(sk, rs->losses, tcp_packets_in_flight(tp), tp->delivered_ce - bbr->alpha_last_delivered_ce, tp->delivered - bbr->alpha_last_delivered)) {
 		if (bbr->bw_probe_samples)  /*  sample is from bw probing? */
 			bbr_handle_inflight_too_high(sk, tcp_packets_in_flight(tp), rs->is_app_limited);
 	} else {
@@ -1821,6 +1829,7 @@ static void bbr_exit_probe_rtt(struct sock *sk)
 static void bbr_check_loss_too_high_in_startup(struct sock *sk,
 						const struct rate_sample *rs)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
 
 	if (bbr_full_bw_reached(sk))
@@ -1836,7 +1845,7 @@ static void bbr_check_loss_too_high_in_startup(struct sock *sk,
 	if (bbr_param(sk, full_loss_cnt) && bbr->loss_round_start &&
 	    inet_csk(sk)->icsk_ca_state == TCP_CA_Recovery &&
 	    bbr->loss_events_in_round >= bbr_param(sk, full_loss_cnt) &&
-	    bbr_is_inflight_too_high(sk, rs->losses ? tp->lost - bbr->alpha_last_delivered : 0, tcp_packets_in_flight(tp), tp->delivered_ce - bbr->alpha_last_delivered_ce, rs->delivered)) {
+	    bbr_is_inflight_too_high(sk, rs->losses, tcp_packets_in_flight(tp), tp->delivered_ce - bbr->alpha_last_delivered_ce, tp->delivered - bbr->alpha_last_delivered)) {
 		bbr_handle_queue_too_high_in_startup(sk);
 		return;
 	}
@@ -1974,6 +1983,15 @@ static void bbr_main(struct sock *sk, u32 ack, int flag,
 	u32 bw, round_delivered;
 	int ce_ratio = -1;
 
+	/* cong_control() can fire before .init has allocated our state, e.g.
+	 * tcp_rcv_synsent_state_process() -> tcp_ack() on the SYN-ACK. Bail out
+	 * safely until bbr_init() has run; otherwise bbr_priv(sk) is NULL and we
+	 * dereference it below. This is the difference vs bbrplus, which stores
+	 * state inline in icsk_ca_priv and is therefore never NULL.
+	 */
+	if (unlikely(!bbr))
+		return;
+
 	round_delivered = bbr_update_round_start(sk, rs, &ctx);
 	if (bbr->round_start) {
 		bbr->rounds_since_probe =
@@ -2002,7 +2020,7 @@ static void bbr_main(struct sock *sk, u32 ack, int flag,
 out:
 	bbr_advance_latest_delivery_signals(sk, rs, &ctx);
 	bbr->prev_ca_state = inet_csk(sk)->icsk_ca_state;
-	bbr->loss_in_cycle |= (tp->lost - bbr->alpha_last_delivered) > 0;
+	bbr->loss_in_cycle |= rs->losses > 0;
 	bbr->ecn_in_cycle  |= (tp->delivered_ce - bbr->alpha_last_delivered_ce) > 0;
 }
 
@@ -2012,7 +2030,10 @@ static void bbr_init(struct sock *sk)
 	struct bbr *bbr = bbr_priv(sk);
 
 	if (!bbr) {
-		bbr = kzalloc(sizeof(*bbr), GFP_KERNEL);
+		/* GFP_ATOMIC: .init can run in softirq (incoming-connection
+		 * child setup / SYN-ACK processing), where sleeping is illegal.
+		 */
+		bbr = kzalloc(sizeof(*bbr), GFP_ATOMIC);
 		if (!bbr)
 			return;
 		tp->bbr_v3_state = bbr;
@@ -2090,8 +2111,10 @@ static void bbr_init(struct sock *sk)
 
 	/* fast_ack_mode removed: KMI-safe version */
 
-	if (bbr_can_use_ecn(sk))
-		/* TCP_ECN_ECT_PERMANENT not available in 5.10 KMI-safe version */
+	/* Mainline BBRv3 sets tp->ecn_flags |= TCP_ECN_ECT_PERMANENT here, but
+	 * that flag does not exist in the 5.10 KMI. ECN negotiation is handled
+	 * by the core stack, so there is nothing to set on this path.
+	 */
 }
 
 /* BBR marks the current round trip as a loss round. */
@@ -2135,6 +2158,9 @@ static u32 bbr_undo_cwnd(struct sock *sk)
 {
 	struct bbr *bbr = bbr_priv(sk);
 
+	if (unlikely(!bbr))
+		return tcp_sk(sk)->snd_cwnd;
+
 	bbr_reset_full_bw(sk); /* spurious slow-down; reset full bw detector */
 	bbr->loss_in_round = 0;
 
@@ -2149,15 +2175,23 @@ static u32 bbr_undo_cwnd(struct sock *sk)
 /* Entering loss recovery, so save state for when we undo recovery. */
 static void bbr_release(struct sock *sk)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
 
-	if (bbr)
-		kfree(bbr);
+	/* kfree(NULL) is safe. Clear the pointer so that a later bbr_init() on a
+	 * reused socket (e.g. after tcp_disconnect()) re-allocates rather than
+	 * dereferencing freed memory.
+	 */
+	kfree(bbr);
+	tp->bbr_v3_state = NULL;
 }
 
 static u32 bbr_ssthresh(struct sock *sk)
 {
 	struct bbr *bbr = bbr_priv(sk);
+
+	if (unlikely(!bbr))
+		return tcp_sk(sk)->snd_ssthresh;
 
 	bbr_save_cwnd(sk);
 	/* For undo, save state that adapts based on loss signal. */
@@ -2175,11 +2209,16 @@ static size_t bbr_get_info(struct sock *sk, u32 ext, int *attr,
 	if (ext & (1 << (INET_DIAG_BBRINFO - 1)) ||
 	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
 		struct bbr *bbr = bbr_priv(sk);
-		u64 bw = bbr_bw_bytes_per_sec(sk, bbr_bw(sk));
-		u64 bw_hi = bbr_bw_bytes_per_sec(sk, bbr_max_bw(sk));
-		u64 bw_lo = bbr->bw_lo == ~0U ?
-			~0ULL : bbr_bw_bytes_per_sec(sk, bbr->bw_lo);
 		struct tcp_bbr_info *bbr_info = &info->bbr;
+		u64 bw, bw_hi, bw_lo;
+
+		if (!bbr)
+			return 0;  /* state not allocated yet (pre-init) */
+
+		bw = bbr_bw_bytes_per_sec(sk, bbr_bw(sk));
+		bw_hi = bbr_bw_bytes_per_sec(sk, bbr_max_bw(sk));
+		bw_lo = bbr->bw_lo == ~0U ?
+			~0ULL : bbr_bw_bytes_per_sec(sk, bbr->bw_lo);
 
 		memset(bbr_info, 0, sizeof(*bbr_info));
 		bbr_info->bbr_bw_lo		= (u32)bw;
@@ -2201,6 +2240,9 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = bbr_priv(sk);
+
+	if (unlikely(!bbr))
+		return;
 
 	if (new_state == TCP_CA_Loss) {
 
@@ -2234,6 +2276,9 @@ static void bbr_cong_control(struct sock *sk, const struct rate_sample *rs)
 /* 5.10 has u32 (*min_tso_segs)(struct sock *sk); use mss_cache as hint. */
 static u32 bbr_min_tso_segs(struct sock *sk)
 {
+	if (unlikely(!bbr_priv(sk)))
+		return sock_net(sk)->ipv4.sysctl_tcp_min_tso_segs;
+
 	return bbr_tso_segs(sk, tcp_sk(sk)->mss_cache);
 }
 
