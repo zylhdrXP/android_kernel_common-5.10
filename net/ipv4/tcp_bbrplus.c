@@ -79,8 +79,8 @@ struct bbr {
 #define CYCLE_LEN	8
 
 static const int bbr_bw_rtts		= CYCLE_LEN + 2;
-static const u32 bbr_min_rtt_win_sec	= 5;
-static const u32 bbr_probe_rtt_mode_ms	= 50;
+static const u32 bbr_min_rtt_win_sec	= 10;
+static const u32 bbr_probe_rtt_mode_ms	= 150;
 static const int bbr_min_tso_rate	= 1200000;
 static const int bbr_high_gain		= BBR_UNIT * 2885 / 1000 + 1;
 static const int bbr_drain_gain		= BBR_UNIT * 1000 / 2885;
@@ -169,7 +169,7 @@ static void bbr_drain_to_target_cycling(struct sock *sk,
 	bw = bbr_max_bw(sk);
 
 	if (bbr->pacing_gain < BBR_UNIT) {
-		if (inflight <= bbr_inflight(sk, bw, BBR_UNIT))
+		if (inflight <= bbr_inflight(sk, bw, BBR_UNIT * 95 / 100))
 			bbr_set_cycle_idx(sk, BBR_BW_PROBE_CRUISE);
 		return;
 	}
@@ -204,12 +204,18 @@ static u32 bbr_bw(const struct sock *sk)
 	return bbr->lt_use_bw ? bbr->lt_bw : bbr_max_bw(sk);
 }
 
+/* Pace at ~1% below estimated bw for balanced throughput and latency.
+ * Matches BBRv3 tuning while BBRplus's drain-to-target cycling and 10s
+ * min_rtt window provide additional stability.
+ */
+static const int bbr_pacing_margin_percent = 1;
+
 static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 {
 	rate *= tcp_mss_to_mtu(sk, tcp_sk(sk)->mss_cache);
 	rate *= gain;
 	rate >>= BBR_SCALE;
-	rate *= USEC_PER_SEC;
+	rate *= USEC_PER_SEC / 100 * (100 - bbr_pacing_margin_percent);
 	return rate >> BW_SCALE;
 }
 
@@ -313,7 +319,7 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
 static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
 {
 	cwnd += 3 * bbr_tso_segs_goal(sk);
-	return cwnd;
+	return max_t(u32, cwnd, bbr_cwnd_min_target);
 }
 
 static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
@@ -392,11 +398,12 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-	u32 cwnd = 0, target_cwnd = 0;
+	u32 cwnd, target_cwnd = 0;
 
 	if (!acked)
 		return;
 
+	cwnd = tp->snd_cwnd;
 	if (bbr_set_cwnd_to_recover_or_restore(sk, rs, acked, &cwnd))
 		goto done;
 
@@ -541,14 +548,10 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	if (!delivered || (lost << BBR_SCALE) < bbr_lt_loss_thresh * delivered)
 		return;
 
-	t = div_u64(tp->delivered_mstamp, USEC_PER_MSEC) - bbr->lt_last_stamp;
-	if ((s32)t < 1)
+	t = tcp_stamp_us_delta(tp->delivered_mstamp,
+			       bbr->lt_last_stamp * USEC_PER_MSEC);
+	if (t < USEC_PER_MSEC)
 		return;
-	if (t >= ~0U / USEC_PER_MSEC) {
-		bbr_reset_lt_bw_sampling(sk);
-		return;
-	}
-	t *= USEC_PER_MSEC;
 	bw = (u64)delivered * BW_UNIT;
 	do_div(bw, t);
 	bbr_lt_bw_interval_done(sk, bw);
